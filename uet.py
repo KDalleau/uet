@@ -3,25 +3,22 @@ from joblib import Parallel, delayed
 import multiprocessing
 
 def random_split(values, type):
-    values = np.array(values)
-    min_val = np.min(values)
-    max_val = np.max(values)
+    min_val = values.min()
+    max_val = values.max()
     if type == 0:
         split = np.random.uniform(min_val, max_val)
     else:
-        index = np.random.randint(0, len(values))
-        split = values[index]
+        split = np.random.choice(values)
     return split
 
 def performSplit(dataset, attributesIndices, attributes, coltypes, nodeIndices):
-    randIndex = np.random.choice(len(attributesIndices))
-    attributeIndex = attributesIndices.pop(randIndex)
-    attribute = attributes[attributeIndex]
+    randIndex = np.random.choice(attributesIndices)
+    attributesIndices = attributesIndices[attributesIndices != randIndex]
+    attribute = attributes[randIndex]
     type = coltypes[attribute]
-    nodeIndices = np.array(nodeIndices)
     data = dataset[nodeIndices, attribute]
-    if len(np.unique(data)) <= 1:
-        return 1, None, None
+    if np.all(data == data[0]):
+        return 1, None, None, attributesIndices
     value = random_split(data, type)
     if type == 0:
         left_mask = data < value
@@ -29,55 +26,69 @@ def performSplit(dataset, attributesIndices, attributes, coltypes, nodeIndices):
         left_mask = data == value
     left = nodeIndices[left_mask]
     right = nodeIndices[~left_mask]
-    return 0, left, right
+    return 0, left, right, attributesIndices
 
 def build_tree_and_update(data, nmin, coltypes, nrows, ncols):
     matrix = np.zeros((nrows, nrows))
     nodes = []
-    attributes = list(range(ncols))
-    attributes_indices = list(range(ncols))
+    attributes = np.arange(ncols)
+    attributes_indices = np.arange(ncols)
     nodeIndices = np.arange(nrows)
-    status, left_indices, right_indices = performSplit(
-        data, attributes_indices.copy(), attributes, coltypes, nodeIndices)
+    status, left_indices, right_indices, attributes_indices_new = performSplit(
+        data, attributes_indices, attributes, coltypes, nodeIndices)
     if status == 1:
-        matrix[np.ix_(nodeIndices, nodeIndices)] += 1.0
+        matrix[nodeIndices[:, None], nodeIndices] += 1.0
         return matrix
     if len(left_indices) < nmin:
-        matrix[np.ix_(left_indices, left_indices)] += 1.0
+        matrix[left_indices[:, None], left_indices] += 1.0
     else:
-        nodes.append({'indices': left_indices, 'attributes_indices': attributes_indices.copy()})
+        nodes.append({'indices': left_indices, 'attributes_indices': attributes_indices_new})
     if len(right_indices) < nmin:
-        matrix[np.ix_(right_indices, right_indices)] += 1.0
+        matrix[right_indices[:, None], right_indices] += 1.0
     else:
-        nodes.append({'indices': right_indices, 'attributes_indices': attributes_indices.copy()})
+        nodes.append({'indices': right_indices, 'attributes_indices': attributes_indices_new})
     while nodes:
-        currentNode = nodes.pop(0)
-        if len(currentNode['attributes_indices']) < 1:
+        currentNode = nodes.pop()
+        if len(currentNode['attributes_indices']) == 0:
             indices = currentNode['indices']
-            matrix[np.ix_(indices, indices)] += 1.0
+            matrix[indices[:, None], indices] += 1.0
             continue
         nodeIndices = currentNode['indices']
         attributes_indices = currentNode['attributes_indices']
-        status, left_indices, right_indices = performSplit(
-            data, attributes_indices.copy(), attributes, coltypes, nodeIndices)
+        status, left_indices, right_indices, attributes_indices_new = performSplit(
+            data, attributes_indices, attributes, coltypes, nodeIndices)
         if status == 1:
-            matrix[np.ix_(nodeIndices, nodeIndices)] += 1.0
+            matrix[nodeIndices[:, None], nodeIndices] += 1.0
         else:
             if len(left_indices) < nmin:
-                matrix[np.ix_(left_indices, left_indices)] += 1.0
+                matrix[left_indices[:, None], left_indices] += 1.0
             else:
-                nodes.append({'indices': left_indices, 'attributes_indices': attributes_indices.copy()})
+                nodes.append({'indices': left_indices, 'attributes_indices': attributes_indices_new})
             if len(right_indices) < nmin:
-                matrix[np.ix_(right_indices, right_indices)] += 1.0
+                matrix[right_indices[:, None], right_indices] += 1.0
             else:
-                nodes.append({'indices': right_indices, 'attributes_indices': attributes_indices.copy()})
+                nodes.append({'indices': right_indices, 'attributes_indices': attributes_indices_new})
     return matrix
 
 def getSim(data, nmin, coltypes, nTrees):
     nrows, ncols = data.shape
     num_cores = multiprocessing.cpu_count()
-    matrices = Parallel(n_jobs=num_cores)(delayed(build_tree_and_update)(data, nmin, coltypes, nrows, ncols) for _ in range(nTrees))
+    trees_per_core = nTrees // num_cores
+    remaining_trees = nTrees % num_cores
+    tree_counts = [trees_per_core] * num_cores
+    for i in range(remaining_trees):
+        tree_counts[i] += 1
+    matrices = Parallel(n_jobs=num_cores)(
+        delayed(build_trees_batch)(data, nmin, coltypes, nrows, ncols, count)
+        for count in tree_counts
+    )
     matrix = sum(matrices) / nTrees
+    return matrix
+
+def build_trees_batch(data, nmin, coltypes, nrows, ncols, count):
+    matrix = np.zeros((nrows, nrows))
+    for _ in range(count):
+        matrix += build_tree_and_update(data, nmin, coltypes, nrows, ncols)
     return matrix
 
 def readCSV(filename, sep):
@@ -117,10 +128,10 @@ def main():
     if massBased == 0:
         matrix = getSim(data, nmin, coltypes, nTrees)
     else:
-        pass  # Implement getDist function if needed
+        pass
     endTime = time()
     print("Time: {:.2f}ms".format((endTime - startTime) * 1000))
     np.savetxt("matrix_uet.csv", matrix, delimiter='\t')
-
+    
 if __name__ == '__main__':
     main()
