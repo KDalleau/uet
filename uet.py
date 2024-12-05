@@ -1,6 +1,7 @@
 import numpy as np
 from joblib import Parallel, delayed
 import multiprocessing
+import pandas as pd
 
 def random_split(values, type):
     min_val = values.min()
@@ -28,49 +29,40 @@ def performSplit(dataset, attributesIndices, attributes, coltypes, nodeIndices):
     right = nodeIndices[~left_mask]
     return 0, left, right, attributesIndices
 
-def build_tree_and_update(data, nmin, coltypes, nrows, ncols):
+def build_tree_and_update(data, nmin, coltypes, nrows, ncols, max_node_size):
     matrix = np.zeros((nrows, nrows))
     nodes = []
     attributes = np.arange(ncols)
     attributes_indices = np.arange(ncols)
     nodeIndices = np.arange(nrows)
-    status, left_indices, right_indices, attributes_indices_new = performSplit(
-        data, attributes_indices, attributes, coltypes, nodeIndices)
-    if status == 1:
-        matrix[nodeIndices[:, None], nodeIndices] += 1.0
-        return matrix
-    if len(left_indices) < nmin:
-        matrix[left_indices[:, None], left_indices] += 1.0
-    else:
-        nodes.append({'indices': left_indices, 'attributes_indices': attributes_indices_new})
-    if len(right_indices) < nmin:
-        matrix[right_indices[:, None], right_indices] += 1.0
-    else:
-        nodes.append({'indices': right_indices, 'attributes_indices': attributes_indices_new})
+    nodes.append({'indices': nodeIndices, 'attributes_indices': attributes_indices})
     while nodes:
         currentNode = nodes.pop()
-        if len(currentNode['attributes_indices']) == 0:
-            indices = currentNode['indices']
-            matrix[indices[:, None], indices] += 1.0
-            continue
         nodeIndices = currentNode['indices']
         attributes_indices = currentNode['attributes_indices']
+        if len(nodeIndices) <= nmin or len(attributes_indices) == 0:
+            if len(nodeIndices) <= max_node_size:
+                matrix[np.ix_(nodeIndices, nodeIndices)] += 1.0
+            continue
         status, left_indices, right_indices, attributes_indices_new = performSplit(
             data, attributes_indices, attributes, coltypes, nodeIndices)
         if status == 1:
-            matrix[nodeIndices[:, None], nodeIndices] += 1.0
+            if len(nodeIndices) <= max_node_size:
+                matrix[np.ix_(nodeIndices, nodeIndices)] += 1.0
         else:
-            if len(left_indices) < nmin:
-                matrix[left_indices[:, None], left_indices] += 1.0
-            else:
-                nodes.append({'indices': left_indices, 'attributes_indices': attributes_indices_new})
-            if len(right_indices) < nmin:
-                matrix[right_indices[:, None], right_indices] += 1.0
-            else:
-                nodes.append({'indices': right_indices, 'attributes_indices': attributes_indices_new})
+            if len(left_indices) > 0:
+                nodes.append({'indices': left_indices, 'attributes_indices': attributes_indices_new.copy()})
+            if len(right_indices) > 0:
+                nodes.append({'indices': right_indices, 'attributes_indices': attributes_indices_new.copy()})
     return matrix
 
-def getSim(data, nmin, coltypes, nTrees):
+def build_trees_batch(data, nmin, coltypes, nrows, ncols, count, max_node_size):
+    matrix = np.zeros((nrows, nrows))
+    for _ in range(count):
+        matrix += build_tree_and_update(data, nmin, coltypes, nrows, ncols, max_node_size)
+    return matrix
+
+def getSim(data, nmin, coltypes, nTrees, max_node_size):
     nrows, ncols = data.shape
     num_cores = multiprocessing.cpu_count()
     trees_per_core = nTrees // num_cores
@@ -79,21 +71,19 @@ def getSim(data, nmin, coltypes, nTrees):
     for i in range(remaining_trees):
         tree_counts[i] += 1
     matrices = Parallel(n_jobs=num_cores)(
-        delayed(build_trees_batch)(data, nmin, coltypes, nrows, ncols, count)
+        delayed(build_trees_batch)(data, nmin, coltypes, nrows, ncols, count, max_node_size)
         for count in tree_counts
     )
     matrix = sum(matrices) / nTrees
     return matrix
 
-def build_trees_batch(data, nmin, coltypes, nrows, ncols, count):
-    matrix = np.zeros((nrows, nrows))
-    for _ in range(count):
-        matrix += build_tree_and_update(data, nmin, coltypes, nrows, ncols)
-    return matrix
-
 def readCSV(filename, sep):
-    data = np.loadtxt(filename, delimiter=sep)
-    return data
+    try:
+        # Read the file using pandas and return a numpy array
+        data = pd.read_csv(filename, sep=sep, header=None).to_numpy()
+        return data
+    except Exception as e:
+        raise ValueError(f"Error reading the file: {e}")
 
 def main():
     import argparse
@@ -105,6 +95,7 @@ def main():
     parser.add_argument('-t', '--ntrees', type=int, default=500, help='Number of trees')
     parser.add_argument('-m', '--massbased', type=int, default=0, help='Mass-based dissimilarity')
     parser.add_argument('-o', '--optimize', type=int, default=0, help='Find optimal parameters')
+    parser.add_argument('--max_node_size', type=int, default=1000, help='Maximum node size to update similarity matrix')
     args = parser.parse_args()
     
     path = args.path
@@ -113,6 +104,7 @@ def main():
     nminPercent = args.nmin
     nTrees = args.ntrees
     massBased = args.massbased
+    max_node_size = args.max_node_size
     
     data = readCSV(path, sep)
     nrows, ncols = data.shape
@@ -122,11 +114,12 @@ def main():
         coltypes = [coltype] * ncols
     else:
         coltypes = [int(c) for c in coltypesString.split(',') if c != '']
+    coltypes = np.array(coltypes)
     
     from time import time
     startTime = time()
     if massBased == 0:
-        matrix = getSim(data, nmin, coltypes, nTrees)
+        matrix = getSim(data, nmin, coltypes, nTrees, max_node_size)
     else:
         pass
     endTime = time()
